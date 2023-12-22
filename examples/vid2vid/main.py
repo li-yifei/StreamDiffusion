@@ -1,15 +1,17 @@
 import os
 import sys
-from typing import Literal, Dict, Optional
+from typing import Dict, Literal, Optional
 
 import fire
 import torch
-from torchvision.io import read_video, write_video
+from torchvision.datasets.video_utils import VideoClips
+from torchvision.io import write_video
 from tqdm import tqdm
 
-sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
 
+sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
 from utils.wrapper import StreamDiffusionWrapper
+
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -25,8 +27,8 @@ def main(
     use_denoising_batch: bool = True,
     enable_similar_image_filter: bool = True,
     seed: int = 2,
+    frames_per_clip: int = 240,
 ):
-
     """
     Process for generating images based on a prompt using a specified model.
 
@@ -57,11 +59,13 @@ def main(
         The seed, by default 2. if -1, use random seed.
     """
 
-    video_info = read_video(input)
-    video = video_info[0] / 255
-    fps = video_info[2]["video_fps"]
-    width = int(video.shape[1] * scale)
-    height = int(video.shape[2] * scale)
+    video_clips = VideoClips([input], clip_length_in_frames=frames_per_clip, frames_between_clips=frames_per_clip)
+    first_video_clip = video_clips.get_clip(0)[0] / 255
+
+    fps = video_clips.video_fps[0]
+    # THWC
+    height = int(first_video_clip.shape[1] * scale)
+    width = int(first_video_clip.shape[2] * scale)
 
     stream = StreamDiffusionWrapper(
         model_id_or_path=model_id,
@@ -86,17 +90,26 @@ def main(
         num_inference_steps=50,
     )
 
-    video_result = torch.zeros(video.shape[0], width, height, 3)
-
+    # output frames size may slightly differ from input frames size
+    # like 854x480 -> 848x480 (WxH)
+    last_streamed_image: torch.Tensor = None
     for _ in range(stream.batch_size):
-        stream(image=video[0].permute(2, 0, 1))
+        last_streamed_image = stream(image=first_video_clip[0].permute(2, 0, 1))
+    # recalculate the actual height and width
+    height = last_streamed_image.shape[1]
+    width = last_streamed_image.shape[2]
+    for n in range(video_clips.num_clips()):
+        video = video_clips.get_clip(n)[0] / 255
+        frames = video.shape[0]
+        video_result = torch.zeros(frames, height, width, 3)
 
-    for i in tqdm(range(video.shape[0])):
-        output_image = stream(video[i].permute(2, 0, 1))
-        video_result[i] = output_image.permute(1, 2, 0)
+        for i in tqdm(range(frames)):
+            output_image = stream(video[i].permute(2, 0, 1))
+            video_result[i] = output_image.permute(1, 2, 0)
 
-    video_result = video_result * 255
-    write_video(output, video_result[2:], fps=fps)
+        video_result = video_result * 255
+        # TODO: merge clips into one video
+        write_video(f"clip.{n}.{output}", video_result[2:], fps=fps)
 
 
 if __name__ == "__main__":
